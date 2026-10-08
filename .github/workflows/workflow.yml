@@ -42,7 +42,7 @@ jobs:
         run: npm install
 
       - name: Install ESLint security rules
-        run: npm install --no-save eslint-plugin-security
+        run: npm install --no-save eslint-plugin-security@2.1.1
 
       - name: Run ESLint (SAST)
         run: |
