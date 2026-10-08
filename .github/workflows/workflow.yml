@@ -45,7 +45,9 @@ jobs:
         run: npm install --no-save eslint-plugin-security
 
       - name: Run ESLint (SAST)
-        run: npx eslint . --ext .js --parser-options '{"ecmaVersion":"latest"}'
+        run: |
+          mv .eslintrc.js .eslintrc.cjs
+          npx eslint . --ext .js --parser-options '{"ecmaVersion":"latest"}'
 
       - name: Install OWASP ZAP
         run: |
