@@ -1,0 +1,107 @@
+name: CI Workflow
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  ci-workflow:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.adminCommand(\"ping\")'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Build application and check dependencies (SCA)
+        run: npm install
+
+      - name: Install ESLint security rules
+        run: npm install --no-save eslint-plugin-security
+
+      - name: Run ESLint (SAST)
+        run: npx eslint . --ext .js --parser-options '{"ecmaVersion":"latest"}'
+
+      - name: Install OWASP ZAP
+        run: |
+          wget -q https://github.com/zaproxy/zaproxy/releases/download/v2.16.0/ZAP_2.16.0_Linux.tar.gz
+          tar -xzf ZAP_2.16.0_Linux.tar.gz
+          echo "ZAP_PATH=$PWD/ZAP_2.16.0" >> "$GITHUB_ENV"
+          python3 -m venv .venv-zap
+          .venv-zap/bin/pip install zapcli
+
+      - name: Run application
+        run: |
+          node index.js > app.log 2>&1 &
+          echo $! > app.pid
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://localhost:3123/test > /dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          cat app.log
+          exit 1
+        env:
+          NODE_ENV: test
+          PORT: 3123
+          MONGODB_URI: mongodb://127.0.0.1:27017/dummyjson-test-db
+          JWT_SECRET: ci-only-test-secret
+
+      - name: Start OWASP ZAP and configure authentication
+        env:
+          APP_USERNAME: ${{ secrets.username }}
+          APP_PASSWORD: ${{ secrets.password }}
+        run: |
+          "$ZAP_PATH/zap.sh" -daemon -host 127.0.0.1 -port 8090 -config api.disablekey=true > zap.log 2>&1 &
+          echo $! > zap.pid
+          .venv-zap/bin/zap-cli -p 8090 status -t 120
+          auth_token="$(curl --fail --silent --show-error \
+            -H 'Content-Type: application/json' \
+            -X POST http://localhost:3123/auth/login \
+            --data "$(jq -nc --arg username "$APP_USERNAME" --arg password "$APP_PASSWORD" \
+              '{username: $username, password: $password}')" | jq -er '.accessToken')"
+          echo "::add-mask::$auth_token"
+          curl --fail --silent --show-error -X POST \
+            http://localhost:8090/JSON/replacer/action/addRule/ \
+            --data-urlencode 'description=Application authentication' \
+            --data-urlencode 'enabled=true' \
+            --data-urlencode 'matchType=REQ_HEADER' \
+            --data-urlencode 'matchRegex=false' \
+            --data-urlencode 'matchString=Authorization' \
+            --data-urlencode "replacement=$auth_token" \
+            --data-urlencode 'initiators=' > /dev/null
+
+      - name: Run authenticated ZAP scan (DAST)
+        run: .venv-zap/bin/zap-cli -p 8090 -v quick-scan --spider http://localhost:3123/
+
+      - name: Stop application and ZAP
+        if: always()
+        run: |
+          if [ -f zap.pid ]; then kill "$(cat zap.pid)" 2>/dev/null || true; fi
+          if [ -f app.pid ]; then kill "$(cat app.pid)" 2>/dev/null || true; fi
